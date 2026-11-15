@@ -1,0 +1,1 @@
+{"dependencies":{"adm-zip":"0.5.16"},"description":"VLESS + WebSocket node for infrlo (Node launcher downloads and runs Xray-core)","engines":{"node":">=18"},"main":"index.js","name":"infrlo-vless","private":true,"scripts":{"start":"node index.js"},"version":"1.0.0"}

@@ -1,0 +1,4 @@
+node_modules/
+.xray/
+config.json
+xray-download.zip
