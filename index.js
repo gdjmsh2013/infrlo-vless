@@ -113,20 +113,139 @@ function writeConfig() {
   return cfgPath;
 }
 
-function startCloudflared() {
+// --- cloudflared supervision -------------------------------------------
+// On 2026-11-15 the tunnel died silently: cloudflared never logged a
+// disconnect, but its attempts to refresh the container's local DNS
+// resolver kept timing out ("lookup region1.v2.argotunnel.com: i/o
+// timeout") and the tunnel never re-registered, leaving the public
+// hostname at Cloudflare 530 while the app showed Running. Two defences:
+// 1) Resolve the tunnel edge IPs ourselves through 1.1.1.1/8.8.8.8
+//    (bypassing the container resolver) and pass them via --edge, so
+//    cloudflared does not need the container DNS to reach the edge.
+// 2) Poll cloudflared's metrics /ready endpoint; if it reports no
+//    registered connections for 3 checks in a row, kill it so the
+//    supervisor restarts and re-registers it.
+let cfProc = null;
+let cfUseEdge = true;
+let cfRapidExits = 0;
+let cfStartedAt = 0;
+let cfBadChecks = 0;
+
+async function resolveEdgeAddrs() {
+  const { Resolver } = require('dns').promises;
+  const resolver = new Resolver();
+  resolver.setServers(['1.1.1.1', '8.8.8.8']);
+  const ips = [];
+  for (const name of ['region1.v2.argotunnel.com', 'region2.v2.argotunnel.com']) {
+    try {
+      const addrs = await resolver.resolve4(name);
+      for (const ip of addrs.slice(0, 2)) {
+        if (!ips.includes(ip)) ips.push(ip);
+      }
+    } catch (err) {
+      console.log('edge resolve failed for ' + name + ': ' + err.message);
+    }
+  }
+  return ips;
+}
+
+async function startCloudflared() {
+  let edgeArgs = [];
+  if (cfUseEdge) {
+    const ips = await resolveEdgeAddrs();
+    if (ips.length) {
+      edgeArgs = [];
+      for (const ip of ips) edgeArgs.push('--edge', ip + ':7844');
+      console.log('cloudflared edge IPs (via 1.1.1.1): ' + ips.join(', '));
+    } else {
+      console.log('edge resolution returned nothing; falling back to default edge discovery.');
+    }
+  }
   console.log('Starting cloudflared tunnel ...');
   // Force HTTP/2 (TCP) transport: on infrlo the QUIC (UDP) connections were
   // dropped every ~2-3 minutes with "timeout: no recent network activity".
+  cfStartedAt = Date.now();
+  cfBadChecks = 0;
   const cf = spawn(
     CF_BIN,
-    ['tunnel', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_TOKEN],
+    [
+      'tunnel',
+      '--no-autoupdate',
+      '--protocol',
+      'http2',
+      '--metrics',
+      '127.0.0.1:19090',
+      ...edgeArgs,
+      'run',
+      '--token',
+      ARGO_TOKEN,
+    ],
     { stdio: 'inherit' }
   );
+  cfProc = cf;
   cf.on('exit', (code) => {
+    if (cfProc === cf) cfProc = null;
+    const lived = Date.now() - cfStartedAt;
+    if (edgeArgs.length && lived < 25000) {
+      cfRapidExits += 1;
+      if (cfRapidExits >= 2) {
+        cfUseEdge = false;
+        console.log('cloudflared keeps exiting quickly with --edge; disabling --edge for future starts.');
+      }
+    } else {
+      cfRapidExits = 0;
+    }
     console.log('cloudflared exited with code ' + code + ', restarting in 5s ...');
-    setTimeout(startCloudflared, 5000);
+    setTimeout(() => {
+      startCloudflared().catch((err) => console.error('cloudflared restart failed:', err.message));
+    }, 5000);
   });
   return cf;
+}
+
+function startCfMonitor() {
+  const http = require('http');
+  setInterval(() => {
+    if (!cfProc) return; // the exit handler is already restarting it
+    let settled = false;
+    const req = http.get('http://127.0.0.1:19090/ready', (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => {
+        settled = true;
+        let ready = 0;
+        try {
+          ready = JSON.parse(body).readyConnections || 0;
+        } catch (err) {
+          /* keep ready = 0 */
+        }
+        if (res.statusCode === 200 && ready > 0) {
+          cfBadChecks = 0;
+          return;
+        }
+        cfBadChecks += 1;
+        console.log(
+          'cloudflared health check bad (' + cfBadChecks + '/3): HTTP ' + res.statusCode + ', readyConnections ' + ready
+        );
+        if (cfBadChecks >= 3 && cfProc) {
+          console.log('cloudflared unhealthy 3 checks in a row; killing it so it re-registers.');
+          cfBadChecks = 0;
+          cfProc.kill('SIGKILL');
+        }
+      });
+    });
+    req.setTimeout(10000, () => req.destroy(new Error('health check timeout')));
+    req.on('error', (err) => {
+      if (settled) return;
+      cfBadChecks += 1;
+      console.log('cloudflared health check error (' + cfBadChecks + '/3): ' + err.message);
+      if (cfBadChecks >= 3 && cfProc) {
+        console.log('cloudflared unreachable 3 checks in a row; killing it so it re-registers.');
+        cfBadChecks = 0;
+        cfProc.kill('SIGKILL');
+      }
+    });
+  }, 60000);
 }
 
 (async () => {
@@ -145,7 +264,8 @@ function startCloudflared() {
   if (ARGO_TOKEN) {
     try {
       await ensureCloudflared();
-      startCloudflared();
+      await startCloudflared();
+      startCfMonitor();
     } catch (err) {
       console.error('cloudflared setup failed (Xray keeps running):', err.message);
     }
