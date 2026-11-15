@@ -108,9 +108,13 @@ function writeConfig() {
 
 function startCloudflared() {
   console.log('Starting cloudflared tunnel ...');
-  const cf = spawn(CF_BIN, ['tunnel', '--no-autoupdate', 'run', '--token', ARGO_TOKEN], {
-    stdio: 'inherit',
-  });
+  // Force HTTP/2 (TCP) transport: on infrlo the QUIC (UDP) connections were
+  // dropped every ~2-3 minutes with "timeout: no recent network activity".
+  const cf = spawn(
+    CF_BIN,
+    ['tunnel', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_TOKEN],
+    { stdio: 'inherit' }
+  );
   cf.on('exit', (code) => {
     console.log('cloudflared exited with code ' + code + ', restarting in 5s ...');
     setTimeout(startCloudflared, 5000);
