@@ -79,6 +79,13 @@ async function ensureCloudflared() {
 function writeConfig() {
   const cfg = {
     log: { loglevel: 'warning' },
+    // The container's local DNS resolver intermittently times out (seen in
+    // cloudflared logs), so resolve target domains through public DNS and
+    // prefer IPv4, whose egress path is the reliable one here.
+    dns: {
+      servers: ['1.1.1.1', '8.8.8.8'],
+      queryStrategy: 'UseIPv4',
+    },
     inbounds: [
       {
         listen: '0.0.0.0',
@@ -97,7 +104,7 @@ function writeConfig() {
       },
     ],
     outbounds: [
-      { protocol: 'freedom', tag: 'direct' },
+      { protocol: 'freedom', tag: 'direct', settings: { domainStrategy: 'UseIPv4' } },
       { protocol: 'blackhole', tag: 'blocked' },
     ],
   };
